@@ -3,6 +3,7 @@ project(chapter3)
 
 set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_FLAGS "-std=c++14 -O3")
+SET(CMAKE_PREFIX_PATH "/usr/lib/x86_64-linux-gnu/cmake")
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 
@@ -10,6 +11,7 @@ find_package(G2O REQUIRED)
 find_package(OpenCV REQUIRED)
 Find_Package(Eigen3 REQUIRED)
 Find_Package(Sophus REQUIRED)
+find_package( PCL 1.7 REQUIRED )
 include_directories(${Sophus_INCLUDE_DIRS})
 
 
@@ -18,18 +20,29 @@ include_directories(${Sophus_INCLUDE_DIRS})
 # Eigen
 include_directories("/usr/include/eigen3")
 include_directories("/home/zhou/Pipeline_ws/src/chapter3")
+
+#include_directories("/usr/include/vtk-6.3")
 include_directories(${PROJECT_SOURCE_DIR} 
                                         ${PROJECT_SOURCE_DIR}/include
                                         ${OpenCV_INCLUDE_DIRS}
                                          ${EIGEN3_INCLUDE_DIR}
                                         ${G2O_INCLUDE_DIRS}
-                                        ${Sophus_INCLUDE_DIRS})
+                                        ${Sophus_INCLUDE_DIRS}
+                                        ${PCL_INCLUDE_DIRS})
+
+add_definitions( ${PCL_DEFINITIONS} )
+link_directories( ${PCL_LIBRARY_DIRS} )                                    
 
 
 add_executable(cylinder_g2o cylinder.cpp)
 target_link_libraries(cylinder_g2o
                                             g2o_core g2o_stuff g2o_types_slam3d ${OpenCV_LIBS} ${G2O_CORE_LIBRARY} ${G2O_STUFF_LIBRARY}
                                              ${OpenCV_LIBS})
+
+add_executable(cylinderDetection cylinderDetection.cpp)
+target_link_libraries(cylinderDetection
+                                            g2o_core g2o_stuff g2o_types_slam3d ${OpenCV_LIBS} ${G2O_CORE_LIBRARY} ${G2O_STUFF_LIBRARY}
+                                             ${OpenCV_LIBS} ${PCL_LIBRARIES})                                        
 
 add_executable(autodiff autodiff.cpp)
 target_link_libraries(autodiff
