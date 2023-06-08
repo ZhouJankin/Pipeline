@@ -113,8 +113,8 @@ void addOuterLandmarks(std::vector<Eigen::Vector3d> &Landmarks, int OuterNum, do
         pt[2] = dist(gen);
         Landmarks.emplace_back(pt);
 //        std::cout<<pt.transpose()<<std::endl;
-    std::cout<<"after add OuterLandmarks size:"<< Landmarks.size()<<std::endl;
     }
+    std::cout<<"after add OuterLandmarks size:"<< Landmarks.size()<<std::endl;
 }
 
 void createCameraPose(std::vector<Eigen::Matrix4d> &v_Twc, std::vector<Eigen::Matrix4d> &v_noisyTwc)
@@ -198,6 +198,187 @@ void saveAsPointCloud(std::vector<Eigen::Vector3d> noisyLandmarks, std::string p
     writer.write(path, *cloud, true);
 }
 
+void optimizeOnce(std::vector<Eigen::Vector3d> &noisyLandmarks, std::vector<bool> OuterIndex, CylinderIntrinsics &abc) {
+    // Setup optimizer
+    g2o::SparseOptimizer optimizer;
+
+    //动态求解块
+    typedef g2o::BlockSolverX BlockSolverType;
+    // 使用dense cholesky分解法
+    typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType; // 线性求解器类型
+    // 梯度下降方法，可以从GN, LM, DogLeg 中选
+    //创建总求解器
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+            g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
+
+    optimizer.setVerbose(false);       // 打开调试输出
+    optimizer.setAlgorithm(solver);
+
+    double focal_length= 480.;
+    Eigen::Vector2d principal_point(320., 240.);
+    //inline g2o::CameraParameters(number_t focal_length, const g2o::Vector2 &principle_point, number_t baseline)
+    g2o::CameraParameters* camera = new g2o::CameraParameters( focal_length, principal_point, 0 );
+    camera->setId(0);
+    optimizer.addParameter( camera );
+//
+    Eigen::Vector2d obs;
+
+    // 往图中增加顶点
+    CylinderFittingVertex *v = new CylinderFittingVertex();
+    //TODO 圆柱参数的初值
+    // abc.rotation = Sophus::SO3d::exp(Eigen::Vector3d(0.1,0.1,23.0));
+    // abc.qx = -2.0;
+    // abc.r = 1.0;
+    v->setEstimate(abc);
+    v->setId(0);
+//    v->setFixed(true);
+    optimizer.addVertex(v);
+
+    //    //map points
+    for (size_t j = 0; j < noisyLandmarks.size(); j++) {
+        //如果是外点则不加入优化
+        if(OuterIndex[j]) {
+            continue;
+        }
+        g2o::VertexPointXYZ *vPoint = new g2o::VertexPointXYZ();
+//        std::cout << noisyLandmarks[j].transpose() << std::endl;
+        vPoint->setEstimate(noisyLandmarks[j]);
+        vPoint->setId(j + 3);
+        //TODO 不对地图点优化？
+        vPoint->setFixed(true);
+//        vPoint->setMarginalized(true);
+        optimizer.addVertex(vPoint);
+    }
+
+    std::vector<CylinderFittingEdge *>  vcy;
+
+    // 往图中增加边
+    for (size_t i = 0; i < noisyLandmarks.size(); i++) {
+        //若外点，则不加入边
+        if(OuterIndex[i]) {
+            continue;
+        }
+        CylinderFittingEdge *edge2 = new CylinderFittingEdge();
+        edge2->setId(noisyLandmarks.size()*2+i);
+        edge2->setVertex(0, optimizer.vertices()[i+3]);             // 设置连接的顶点
+        edge2->setVertex(1, optimizer.vertices()[0]);
+        edge2->setInformation(Eigen::Matrix<double, 1, 1>::Identity()); // 信息矩阵：协方差矩阵之逆
+        optimizer.addEdge(edge2);
+        vcy.push_back(edge2);
+    }
+
+    optimizer.initializeOptimization();
+    optimizer.optimize(40);
+    abc.rotation = v->estimate().rotation;
+    abc.qx = v->estimate().qx;
+    abc.r = v->estimate().r;
+}
+
+//TODO 这里不用引用会影响性能吗
+std::vector<double> computeDistance(std::vector<Eigen::Vector3d> noisyLandmarks, CylinderIntrinsics abc) {
+    int size = noisyLandmarks.size();
+    std::vector<double> dists (size, 0);
+    Eigen::Matrix3d A;
+        A << 1., 0., 0., 0., 1., 0., 0., 0., 0.;
+    for(int i = 0; i < size; ++i) {
+        Eigen::Vector3d u = A *((abc.rotation.matrix() * noisyLandmarks[i]) + Eigen::Vector3d(abc.qx, 0, 0));
+        dists[i] = sqrt(u.transpose() * u);
+    }
+    return dists;
+}
+
+double computeMean(std::vector<double> dists) {
+    //TODO 还有没有求和方法
+    double sum = std::accumulate(std::begin(dists), std::end(dists), 0.0);
+    return sum / dists.size();
+}
+
+double computeStdDev(std::vector<double> dists, double mean) {
+    double accum = 0.;
+    for(double dist : dists) {
+        accum += (dist - mean) * (dist - mean);
+    }
+    return accum / dists.size();
+}
+
+//循环优化部分代码
+ std::vector<Eigen::Vector3d> loopOptimization(std::vector<Eigen::Vector3d> &noisyLandmarks, CylinderIntrinsics &abc) {
+    int iteration = 0;
+    //设置部分参数
+    double sigma_threshold = 0.8;
+    double sigma;
+    int inner_num_threshold = 50;   //内点数量阈值，若小于该阈值判断没有圆柱环境
+    int iteration_threshold = 50;
+    int last_inner_size;
+    int size = noisyLandmarks.size();
+    std::vector<bool> isOuter(size,  false);
+    do {
+        iteration++;
+        optimizeOnce(noisyLandmarks, isOuter, abc);
+        std::cout<<"一次优化后结果："<<std::endl;
+        std::cout<<abc.rotation.log()<<std::endl;
+        std::cout<< abc.qx<<' '<< abc.r<<std::endl;
+
+        std::vector<double> dists = computeDistance(noisyLandmarks, abc);
+        double mean = computeMean(dists);
+        double stdDev = computeStdDev(dists, mean);
+        sigma = stdDev;
+
+        std::cout<<"mean = :"<<mean<<std::endl;
+        std::cout<<"stdDev = :"<<stdDev<<std::endl;
+
+        //筛选内点
+        //记录外点数目
+        int Outer_size = 0;
+        for(int i = 0; i < size; ++i) {
+            if(fabs(dists[i] - mean) > 1.96 * stdDev) {
+                isOuter[i] = true;
+                Outer_size++;
+            }
+            else {
+                isOuter[i] = false;
+            }
+        }
+        int inner_size = size - Outer_size;
+        std::cout<<"第 "<<iteration<<"轮迭代, 外点数目为："<<Outer_size<<std::endl;
+        std::cout<<"第 "<<iteration<<"轮迭代, 内点数目为："<<inner_size<<std::endl;
+
+        if(inner_size < inner_num_threshold) {
+            std::cout<<"第 "<<iteration<<"轮迭代，内点数量小于阈值，非圆柱环境"<<std::endl;
+            break;
+        }
+
+        if(iteration > iteration_threshold) {
+            std::cout<<"第 "<<iteration<<"轮迭代，迭代次数到达上限"<<std::endl;
+            break;
+        }
+
+        if(iteration > 1 && inner_size == last_inner_size) {
+            std::cout<<"第 "<<iteration<<"轮迭代，内点数量与上一次循环无变化"<<std::endl;
+            break;
+        }
+        //记录内点数量，与下一轮比较
+        last_inner_size = inner_size;
+        
+    }
+    while(sigma > sigma_threshold);
+
+    //打印外点index
+    std::cout<<"打印外点index"<<std::endl;
+    std::vector<Eigen::Vector3d> inner_Landmarks;
+    for(int i = 0; i < size; ++i) {
+        if(isOuter[i]) {
+            std::cout<<i<<std::endl;
+        }
+        else {
+            inner_Landmarks.push_back(noisyLandmarks[i]);
+        }
+    }
+
+    return inner_Landmarks;
+    
+ }
+
 int main()
 {
     std::vector<Eigen::Vector3d> landmarks;
@@ -208,7 +389,7 @@ int main()
     double r = 10;
     double stdNoise = 0.02;
     double maxDist = 15;
-    int OuterNum = 50;
+    int OuterNum = 100;
     std::string ply_save_path = "../save.ply";
 
     createLandmarks(landmarks, r, pointNum);
@@ -226,70 +407,82 @@ int main()
     cv::cv2eigen(cv_K, K);
 
     std::vector<Eigen::Vector2i> features_curr;
-    // Setup optimizer
-    g2o::SparseOptimizer optimizer;
 
-    //动态求解块
-    typedef g2o::BlockSolverX BlockSolverType;
-    // 使用dense cholesky分解法
-    typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType; // 线性求解器类型
-    // 梯度下降方法，可以从GN, LM, DogLeg 中选
-    //创建总求解器
-    auto solver = new g2o::OptimizationAlgorithmLevenberg(
-            g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
-
-    optimizer.setVerbose(true);       // 打开调试输出
-    optimizer.setAlgorithm(solver);
-
-    double focal_length= 480.;
-    Eigen::Vector2d principal_point(320., 240.);
-    //inline g2o::CameraParameters(number_t focal_length, const g2o::Vector2 &principle_point, number_t baseline)
-    g2o::CameraParameters* camera = new g2o::CameraParameters( focal_length, principal_point, 0 );
-    camera->setId(0);
-    optimizer.addParameter( camera );
-//
-    Eigen::Vector2d obs;
-
-    // 往图中增加顶点
-    CylinderFittingVertex *v = new CylinderFittingVertex();
-    //动态vector?
     CylinderIntrinsics abc;
+    //TODO 设定圆柱参数初值
     abc.rotation = Sophus::SO3d::exp(Eigen::Vector3d(0.1,0.1,23.0));
     abc.qx = -2.0;
     abc.r = 1.0;
-    v->setEstimate(abc);
-    v->setId(0);
-//    v->setFixed(true);
-    optimizer.addVertex(v);
 
-    //    //map points
-    for (size_t j = 0; j < noisyLandmarks.size(); j++) {
-        g2o::VertexPointXYZ *vPoint = new g2o::VertexPointXYZ();
-//        std::cout << noisyLandmarks[j].transpose() << std::endl;
-        vPoint->setEstimate(noisyLandmarks[j]);
-        vPoint->setId(j + 3);
-//        vPoint->setFixed(true);
-//        vPoint->setMarginalized(true);
-        optimizer.addVertex(vPoint);
-    }
+    std::vector<Eigen::Vector3d> inner_Landmarks = loopOptimization(noisyLandmarks, abc);
 
-    std::vector<CylinderFittingEdge *>  vcy;
+    saveAsPointCloud(inner_Landmarks, "../result.ply");
 
-    // 往图中增加边
-    for (size_t i = 0; i < noisyLandmarks.size(); i++) {
-        CylinderFittingEdge *edge2 = new CylinderFittingEdge();
-        edge2->setId(noisyLandmarks.size()*2+i);
-        edge2->setVertex(0, optimizer.vertices()[i+3]);             // 设置连接的顶点
-        edge2->setVertex(1, optimizer.vertices()[0]);
-        edge2->setInformation(Eigen::Matrix<double, 1, 1>::Identity()); // 信息矩阵：协方差矩阵之逆
-        optimizer.addEdge(edge2);
-        vcy.push_back(edge2);
-    }
 
-    optimizer.initializeOptimization();
-    optimizer.optimize(50);
-    std::cout<<v->estimate().rotation.log()<<std::endl;
-    std::cout<< v->estimate().qx<<' '<< v->estimate().r<<std::endl;
+//     // Setup optimizer
+//     g2o::SparseOptimizer optimizer;
+
+//     //动态求解块
+//     typedef g2o::BlockSolverX BlockSolverType;
+//     // 使用dense cholesky分解法
+//     typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType> LinearSolverType; // 线性求解器类型
+//     // 梯度下降方法，可以从GN, LM, DogLeg 中选
+//     //创建总求解器
+//     auto solver = new g2o::OptimizationAlgorithmLevenberg(
+//             g2o::make_unique<BlockSolverType>(g2o::make_unique<LinearSolverType>()));
+
+//     optimizer.setVerbose(true);       // 打开调试输出
+//     optimizer.setAlgorithm(solver);
+
+//     double focal_length= 480.;
+//     Eigen::Vector2d principal_point(320., 240.);
+//     //inline g2o::CameraParameters(number_t focal_length, const g2o::Vector2 &principle_point, number_t baseline)
+//     g2o::CameraParameters* camera = new g2o::CameraParameters( focal_length, principal_point, 0 );
+//     camera->setId(0);
+//     optimizer.addParameter( camera );
+// //
+//     Eigen::Vector2d obs;
+
+//     // 往图中增加顶点
+//     CylinderFittingVertex *v = new CylinderFittingVertex();
+//     //动态vector?
+//     CylinderIntrinsics abc;
+//     abc.rotation = Sophus::SO3d::exp(Eigen::Vector3d(0.1,0.1,23.0));
+//     abc.qx = -2.0;
+//     abc.r = 1.0;
+//     v->setEstimate(abc);
+//     v->setId(0);
+// //    v->setFixed(true);
+//     optimizer.addVertex(v);
+
+//     //    //map points
+//     for (size_t j = 0; j < noisyLandmarks.size(); j++) {
+//         g2o::VertexPointXYZ *vPoint = new g2o::VertexPointXYZ();
+// //        std::cout << noisyLandmarks[j].transpose() << std::endl;
+//         vPoint->setEstimate(noisyLandmarks[j]);
+//         vPoint->setId(j + 3);
+// //        vPoint->setFixed(true);
+// //        vPoint->setMarginalized(true);
+//         optimizer.addVertex(vPoint);
+//     }
+
+//     std::vector<CylinderFittingEdge *>  vcy;
+
+//     // 往图中增加边
+//     for (size_t i = 0; i < noisyLandmarks.size(); i++) {
+//         CylinderFittingEdge *edge2 = new CylinderFittingEdge();
+//         edge2->setId(noisyLandmarks.size()*2+i);
+//         edge2->setVertex(0, optimizer.vertices()[i+3]);             // 设置连接的顶点
+//         edge2->setVertex(1, optimizer.vertices()[0]);
+//         edge2->setInformation(Eigen::Matrix<double, 1, 1>::Identity()); // 信息矩阵：协方差矩阵之逆
+//         optimizer.addEdge(edge2);
+//         vcy.push_back(edge2);
+//     }
+
+//     optimizer.initializeOptimization();
+//     optimizer.optimize(50);
+//     std::cout<<v->estimate().rotation.log()<<std::endl;
+//     std::cout<< v->estimate().qx<<' '<< v->estimate().r<<std::endl;
 
     return 0;
 }
