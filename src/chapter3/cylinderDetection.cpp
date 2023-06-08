@@ -274,54 +274,67 @@ void optimizeOnce(std::vector<Eigen::Vector3d> &noisyLandmarks, std::vector<bool
     abc.r = v->estimate().r;
 }
 
-//TODO 这里不用引用会影响性能吗
-std::vector<double> computeDistance(std::vector<Eigen::Vector3d> noisyLandmarks, CylinderIntrinsics abc) {
+std::vector<double> computeDistance(const std::vector<Eigen::Vector3d> &noisyLandmarks, CylinderIntrinsics abc) {
     int size = noisyLandmarks.size();
-    std::vector<double> dists (size, 0);
+    std::vector<double> dists;
     Eigen::Matrix3d A;
         A << 1., 0., 0., 0., 1., 0., 0., 0., 0.;
     for(int i = 0; i < size; ++i) {
         Eigen::Vector3d u = A *((abc.rotation.matrix() * noisyLandmarks[i]) + Eigen::Vector3d(abc.qx, 0, 0));
-        dists[i] = sqrt(u.transpose() * u);
+        dists.push_back(sqrt(u.transpose() * u));
     }
     return dists;
 }
 
-double computeMean(std::vector<double> dists) {
+//仅计算内点的均值
+double computeMean(const std::vector<double> &dists, const std::vector<bool> &isOuter, int InnerNum) {
     //TODO 还有没有求和方法
-    double sum = std::accumulate(std::begin(dists), std::end(dists), 0.0);
-    return sum / dists.size();
+    // double sum = std::accumulate(std::begin(dists), std::end(dists), 0.0);
+    double sum = 0;
+    for(int i = 0; i < dists.size(); ++i) {
+        if(isOuter[i]) {
+            continue;
+        }
+        sum += dists[i];
+    }
+    return sum / InnerNum;
 }
 
-double computeStdDev(std::vector<double> dists, double mean) {
+double computeStdDev(const std::vector<double> &dists, double mean, const std::vector<bool> &isOuter, int InnerNum) {
     double accum = 0.;
-    for(double dist : dists) {
-        accum += (dist - mean) * (dist - mean);
+    for(int i = 0; i < dists.size(); ++i) {
+        if(isOuter[i]) {
+            continue;
+        }
+        accum += (dists[i] - mean) * (dists[i] - mean);
     }
-    return accum / dists.size();
+    return accum / InnerNum;
 }
 
 //循环优化部分代码
  std::vector<Eigen::Vector3d> loopOptimization(std::vector<Eigen::Vector3d> &noisyLandmarks, CylinderIntrinsics &abc) {
     int iteration = 0;
     //设置部分参数
-    double sigma_threshold = 0.8;
+    double sigma_threshold = 1.2;
     double sigma;
     int inner_num_threshold = 50;   //内点数量阈值，若小于该阈值判断没有圆柱环境
     int iteration_threshold = 50;
-    int last_inner_size;
+    
     int size = noisyLandmarks.size();
+    int last_inner_size = size;
+
     std::vector<bool> isOuter(size,  false);
     do {
         iteration++;
         optimizeOnce(noisyLandmarks, isOuter, abc);
-        std::cout<<"一次优化后结果："<<std::endl;
+        std::cout<<"第"<<iteration<<"次优化后结果："<<std::endl;
         std::cout<<abc.rotation.log()<<std::endl;
         std::cout<< abc.qx<<' '<< abc.r<<std::endl;
-
+        
+        //这里应该计算的是所有点的距离dists, 内点的mean std
         std::vector<double> dists = computeDistance(noisyLandmarks, abc);
-        double mean = computeMean(dists);
-        double stdDev = computeStdDev(dists, mean);
+        double mean = computeMean(dists, isOuter, last_inner_size);
+        double stdDev = computeStdDev(dists, mean, isOuter, last_inner_size);
         sigma = stdDev;
 
         std::cout<<"mean = :"<<mean<<std::endl;
